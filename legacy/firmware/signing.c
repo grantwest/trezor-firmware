@@ -69,7 +69,7 @@ static uint8_t pubkey[33], sig[64];
 static uint8_t decred_hash_prefix[32];
 #endif
 static uint8_t hash_inputs_check[32];
-static uint64_t to_spend, spending, change_spend;
+static uint64_t total_in, total_out, change_out;
 static uint32_t version = 1;
 static uint32_t lock_time = 0;
 static uint32_t expiry = 0;
@@ -614,9 +614,9 @@ void signing_init(const SignTx *msg, const CoinInfo *_coin,
 
   signatures = 0;
   idx1 = 0;
-  to_spend = 0;
-  spending = 0;
-  change_spend = 0;
+  total_in = 0;
+  total_out = 0;
+  change_out = 0;
   change_count = 0;
   memzero(&input, sizeof(TxInputType));
   memzero(&resp, sizeof(TxRequest));
@@ -934,12 +934,12 @@ static bool signing_check_output(TxOutputType *txoutput) {
   bool is_change = is_change_output(&info, txoutput);
 
   if (is_change) {
-    if (change_spend + txoutput->amount < change_spend) {
+    if (change_out + txoutput->amount < change_out) {
       fsm_sendFailure(FailureType_Failure_DataError, _("Value overflow"));
       signing_abort();
       return false;
     }
-    change_spend += txoutput->amount;
+    change_out += txoutput->amount;
 
     change_count++;
     if (change_count <= 0) {
@@ -949,12 +949,12 @@ static bool signing_check_output(TxOutputType *txoutput) {
     }
   }
 
-  if (spending + txoutput->amount < spending) {
+  if (total_out + txoutput->amount < total_out) {
     fsm_sendFailure(FailureType_Failure_DataError, _("Value overflow"));
     signing_abort();
     return false;
   }
-  spending += txoutput->amount;
+  total_out += txoutput->amount;
   int co = compile_output(coin, &root, txoutput, &bin_output, !is_change);
   if (!is_change) {
     layoutProgress(_("Signing transaction"), progress);
@@ -991,7 +991,7 @@ static bool signing_confirm_tx(void) {
     // bypass check for negative fee coins, required for reward TX
   } else {
     // check fees
-    if (spending > to_spend) {
+    if (total_out > total_in) {
       fsm_sendFailure(FailureType_Failure_NotEnoughFunds,
                       _("Not enough funds"));
       signing_abort();
@@ -1000,8 +1000,8 @@ static bool signing_confirm_tx(void) {
   }
 
   uint64_t fee = 0;
-  if (spending <= to_spend) {
-    fee = to_spend - spending;
+  if (total_out <= total_in) {
+    fee = total_in - total_out;
     if (fee > ((uint64_t)tx_weight * coin->maxfee_kb) / 4000) {
       layoutFeeOverThreshold(coin, fee);
       if (!protectButton(ButtonRequestType_ButtonRequest_FeeOverThreshold,
@@ -1035,7 +1035,7 @@ static bool signing_confirm_tx(void) {
   }
 
   // last confirmation
-  layoutConfirmTx(coin, to_spend - change_spend, fee);
+  layoutConfirmTx(coin, total_in - change_out, fee);
   if (!protectButton(ButtonRequestType_ButtonRequest_SignTx, false)) {
     fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
     signing_abort();
@@ -1344,12 +1344,12 @@ void signing_txack(TransactionType *tx) {
         return;
       }
 
-      if (to_spend + tx->inputs[0].amount < to_spend) {
+      if (total_in + tx->inputs[0].amount < total_in) {
         fsm_sendFailure(FailureType_Failure_DataError, _("Value overflow"));
         signing_abort();
         return;
       }
-      to_spend += tx->inputs[0].amount;
+      total_in += tx->inputs[0].amount;
 
       tx_weight += tx_input_weight(coin, &tx->inputs[0]);
 #if !BITCOIN_ONLY
