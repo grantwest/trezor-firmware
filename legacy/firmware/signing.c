@@ -62,10 +62,9 @@ static TxRequest resp;
 static TxInputType input;
 static TxOutputBinType bin_output;
 static TxStruct to, tp, ti;
-static Hasher hasher_prevouts, hasher_sequence, hasher_outputs, hasher_check;
+static Hasher hasher_check;
 static uint8_t CONFIDENTIAL privkey[32];
 static uint8_t pubkey[33], sig[64];
-static uint8_t hash_prevouts[32], hash_sequence[32], hash_outputs[32];
 #if !BITCOIN_ONLY
 static uint8_t decred_hash_prefix[32];
 #endif
@@ -76,17 +75,29 @@ static uint32_t lock_time = 0;
 static uint32_t expiry = 0;
 static uint32_t version_group_id = 0;
 static uint32_t timestamp = 0;
-static uint32_t min_sequence = 0;
 #if !BITCOIN_ONLY
 static uint32_t branch_id = 0;
 #endif
 static uint32_t next_nonsegwit_input;
 static uint32_t progress, progress_step, progress_meta_step;
-static bool multisig_fp_set, multisig_fp_mismatch;
-static uint8_t multisig_fp[32];
-static uint32_t in_address_n[8];
-static size_t in_address_n_count;
 static uint32_t tx_weight;
+
+typedef struct {
+  Hasher hasher_prevouts;
+  Hasher hasher_sequence;
+  Hasher hasher_outputs;
+  uint8_t hash_prevouts[32];
+  uint8_t hash_sequence[32];
+  uint8_t hash_outputs[32];
+  uint32_t min_sequence;
+  bool multisig_fp_set;
+  bool multisig_fp_mismatch;
+  uint8_t multisig_fp[32];
+  uint32_t in_address_n[8];
+  size_t in_address_n_count;
+} TxInfo;
+
+static TxInfo info;
 
 /* A marker for in_address_n_count to indicate a mismatch in bip32 paths in
    input */
@@ -400,11 +411,11 @@ void phase1_request_next_input(void) {
     send_req_1_input();
   } else {
     //  compute segwit hashPrevouts & hashSequence
-    hasher_Final(&hasher_prevouts, hash_prevouts);
-    hasher_Final(&hasher_sequence, hash_sequence);
+    hasher_Final(&info.hasher_prevouts, info.hash_prevouts);
+    hasher_Final(&info.hasher_sequence, info.hash_sequence);
     hasher_Final(&hasher_check, hash_inputs_check);
     // init hashOutputs
-    hasher_Reset(&hasher_outputs);
+    hasher_Reset(&info.hasher_outputs);
     idx1 = 0;
     send_req_2_output();
   }
@@ -419,39 +430,40 @@ void phase2_request_next_input(void) {
   }
 }
 
-void extract_input_bip32_path(const TxInputType *tinput) {
-  if (in_address_n_count == BIP32_NOCHANGEALLOWED) {
+void extract_input_bip32_path(TxInfo *tx_info, const TxInputType *tinput) {
+  if (tx_info->in_address_n_count == BIP32_NOCHANGEALLOWED) {
     return;
   }
   size_t count = tinput->address_n_count;
   if (count < BIP32_WALLET_DEPTH) {
     // no change address allowed
-    in_address_n_count = BIP32_NOCHANGEALLOWED;
+    tx_info->in_address_n_count = BIP32_NOCHANGEALLOWED;
     return;
   }
-  if (in_address_n_count == 0) {
+  if (tx_info->in_address_n_count == 0) {
     // initialize in_address_n on first input seen
-    in_address_n_count = count;
+    tx_info->in_address_n_count = count;
     // store the bip32 path up to the account
-    memcpy(in_address_n, tinput->address_n,
+    memcpy(tx_info->in_address_n, tinput->address_n,
            (count - BIP32_WALLET_DEPTH) * sizeof(uint32_t));
     return;
   }
   // check that all addresses use a path of same length
-  if (in_address_n_count != count) {
-    in_address_n_count = BIP32_NOCHANGEALLOWED;
+  if (tx_info->in_address_n_count != count) {
+    tx_info->in_address_n_count = BIP32_NOCHANGEALLOWED;
     return;
   }
   // check that the bip32 path up to the account matches
-  if (memcmp(in_address_n, tinput->address_n,
+  if (memcmp(tx_info->in_address_n, tinput->address_n,
              (count - BIP32_WALLET_DEPTH) * sizeof(uint32_t)) != 0) {
     // mismatch -> no change address allowed
-    in_address_n_count = BIP32_NOCHANGEALLOWED;
+    tx_info->in_address_n_count = BIP32_NOCHANGEALLOWED;
     return;
   }
 }
 
-bool check_change_bip32_path(const TxOutputType *toutput) {
+bool check_change_bip32_path(const TxInfo *tx_info,
+                             const TxOutputType *toutput) {
   size_t count = toutput->address_n_count;
 
   // Check that the change path has the same bip32 path length,
@@ -459,29 +471,29 @@ bool check_change_bip32_path(const TxOutputType *toutput) {
   // (chain id and address) are as expected.
   // Note: count >= BIP32_WALLET_DEPTH and count == in_address_n_count
   // imply that in_address_n_count != BIP32_NOCHANGEALLOWED
-  return (count >= BIP32_WALLET_DEPTH && count == in_address_n_count &&
-          0 == memcmp(in_address_n, toutput->address_n,
+  return (count >= BIP32_WALLET_DEPTH && count == tx_info->in_address_n_count &&
+          0 == memcmp(tx_info->in_address_n, toutput->address_n,
                       (count - BIP32_WALLET_DEPTH) * sizeof(uint32_t)) &&
           toutput->address_n[count - 2] <= BIP32_CHANGE_CHAIN &&
           toutput->address_n[count - 1] <= BIP32_MAX_LAST_ELEMENT);
 }
 
 bool compile_input_script_sig(TxInputType *tinput) {
-  if (!multisig_fp_mismatch) {
+  if (!info.multisig_fp_mismatch) {
     // check that this is still multisig
     uint8_t h[32] = {0};
     if (!tinput->has_multisig ||
         cryptoMultisigFingerprint(&(tinput->multisig), h) == 0 ||
-        memcmp(multisig_fp, h, 32) != 0) {
+        memcmp(info.multisig_fp, h, 32) != 0) {
       // Transaction has changed during signing
       return false;
     }
   }
-  if (in_address_n_count != BIP32_NOCHANGEALLOWED) {
+  if (info.in_address_n_count != BIP32_NOCHANGEALLOWED) {
     // check that input address didn't change
     size_t count = tinput->address_n_count;
-    if (count < 2 || count != in_address_n_count ||
-        0 != memcmp(in_address_n, tinput->address_n,
+    if (count < 2 || count != info.in_address_n_count ||
+        0 != memcmp(info.in_address_n, tinput->address_n,
                     (count - 2) * sizeof(uint32_t))) {
       return false;
     }
@@ -509,6 +521,31 @@ bool compile_input_script_sig(TxInputType *tinput) {
   return tinput->script_sig.size > 0;
 }
 
+static void tx_info_init(TxInfo *tx_info) {
+  tx_info->min_sequence = SEQUENCE_FINAL;
+  tx_info->in_address_n_count = 0;
+  tx_info->multisig_fp_set = false;
+  tx_info->multisig_fp_mismatch = false;
+
+#if !BITCOIN_ONLY
+  if (coin->overwintered) {
+    // ZIP-243
+    hasher_InitParam(&tx_info->hasher_prevouts, HASHER_BLAKE2B_PERSONAL,
+                     "ZcashPrevoutHash", 16);
+    hasher_InitParam(&tx_info->hasher_sequence, HASHER_BLAKE2B_PERSONAL,
+                     "ZcashSequencHash", 16);
+    hasher_InitParam(&tx_info->hasher_outputs, HASHER_BLAKE2B_PERSONAL,
+                     "ZcashOutputsHash", 16);
+  } else
+#endif
+  {
+    // BIP-143
+    hasher_Init(&tx_info->hasher_prevouts, coin->curve->hasher_sign);
+    hasher_Init(&tx_info->hasher_sequence, coin->curve->hasher_sign);
+    hasher_Init(&tx_info->hasher_outputs, coin->curve->hasher_sign);
+  }
+}
+
 void signing_init(const SignTx *msg, const CoinInfo *_coin,
                   const HDNode *_root) {
   inputs_count = msg->inputs_count;
@@ -517,7 +554,6 @@ void signing_init(const SignTx *msg, const CoinInfo *_coin,
   memcpy(&root, _root, sizeof(HDNode));
   version = msg->version;
   lock_time = msg->lock_time;
-  min_sequence = SEQUENCE_FINAL;
 
   if (!coin->overwintered) {
     if (msg->has_version_group_id) {
@@ -591,9 +627,7 @@ void signing_init(const SignTx *msg, const CoinInfo *_coin,
   // this means 50 % per phase.
   progress_step = (500 << PROGRESS_PRECISION) / inputs_count;
 
-  in_address_n_count = 0;
-  multisig_fp_set = false;
-  multisig_fp_mismatch = false;
+  tx_info_init(&info);
   next_nonsegwit_input = 0xffffffff;
 
   tx_init(&to, inputs_count, outputs_count, version, lock_time, expiry, 0,
@@ -613,24 +647,7 @@ void signing_init(const SignTx *msg, const CoinInfo *_coin,
   }
 #endif
 
-  // segwit hashes for hashPrevouts and hashSequence
-#if !BITCOIN_ONLY
-  if (coin->overwintered) {
-    hasher_InitParam(&hasher_prevouts, HASHER_BLAKE2B_PERSONAL,
-                     "ZcashPrevoutHash", 16);
-    hasher_InitParam(&hasher_sequence, HASHER_BLAKE2B_PERSONAL,
-                     "ZcashSequencHash", 16);
-    hasher_InitParam(&hasher_outputs, HASHER_BLAKE2B_PERSONAL,
-                     "ZcashOutputsHash", 16);
-    hasher_Init(&hasher_check, coin->curve->hasher_sign);
-  } else
-#endif
-  {
-    hasher_Init(&hasher_prevouts, coin->curve->hasher_sign);
-    hasher_Init(&hasher_sequence, coin->curve->hasher_sign);
-    hasher_Init(&hasher_outputs, coin->curve->hasher_sign);
-    hasher_Init(&hasher_check, coin->curve->hasher_sign);
-  }
+  hasher_Init(&hasher_check, coin->curve->hasher_sign);
 
   layoutProgressSwipe(_("Signing transaction"), 0);
 
@@ -780,11 +797,11 @@ static bool signing_validate_bin_output(TxOutputBinType *tx_bin_output) {
   return true;
 }
 
-static bool signing_check_input(const TxInputType *txinput) {
+static bool tx_info_add_input(TxInfo *tx_info, const TxInputType *txinput) {
   /* compute multisig fingerprint */
-  /* (if all input share the same fingerprint, outputs having the same
+  /* (if all inputs share the same fingerprint, outputs having the same
    * fingerprint will be considered as change outputs) */
-  if (txinput->has_multisig && !multisig_fp_mismatch) {
+  if (txinput->has_multisig && !tx_info->multisig_fp_mismatch) {
     uint8_t h[32] = {0};
     if (cryptoMultisigFingerprint(&txinput->multisig, h) == 0) {
       fsm_sendFailure(FailureType_Failure_ProcessError,
@@ -792,28 +809,38 @@ static bool signing_check_input(const TxInputType *txinput) {
       signing_abort();
       return false;
     }
-    if (multisig_fp_set) {
-      if (memcmp(multisig_fp, h, 32) != 0) {
-        multisig_fp_mismatch = true;
+    if (tx_info->multisig_fp_set) {
+      if (memcmp(tx_info->multisig_fp, h, 32) != 0) {
+        tx_info->multisig_fp_mismatch = true;
       }
     } else {
-      memcpy(multisig_fp, h, 32);
-      multisig_fp_set = true;
+      memcpy(tx_info->multisig_fp, h, 32);
+      tx_info->multisig_fp_set = true;
     }
   } else {  // single signature
-    multisig_fp_mismatch = true;
+    tx_info->multisig_fp_mismatch = true;
   }
 
   // remember the input bip32 path
   // change addresses must use the same bip32 path as all inputs
-  extract_input_bip32_path(txinput);
+  extract_input_bip32_path(tx_info, txinput);
 
   // remember the minimum nSequence value
-  if (txinput->sequence < min_sequence) min_sequence = txinput->sequence;
+  if (txinput->sequence < tx_info->min_sequence) {
+    tx_info->min_sequence = txinput->sequence;
+  }
 
   // compute segwit hashPrevouts & hashSequence
-  tx_prevout_hash(&hasher_prevouts, txinput);
-  tx_sequence_hash(&hasher_sequence, txinput);
+  tx_prevout_hash(&tx_info->hasher_prevouts, txinput);
+  tx_sequence_hash(&tx_info->hasher_sequence, txinput);
+
+  return true;
+}
+
+static bool signing_check_input(const TxInputType *txinput) {
+  if (!tx_info_add_input(&info, txinput)) {
+    return false;
+  }
 
 #if !BITCOIN_ONLY
   if (coin->decred) {
@@ -873,32 +900,38 @@ static bool signing_check_prevtx_hash(void) {
   return true;
 }
 
+static bool is_change_output(const TxInfo *tx_info,
+                             const TxOutputType *txoutput) {
+  if (!is_change_output_script_type(txoutput)) {
+    return false;
+  }
+
+  if (txoutput->address_n_count == 0) {
+    return false;
+  }
+
+  /*
+   * For multisig check that all inputs are multisig
+   */
+  if (txoutput->has_multisig) {
+    uint8_t h[32] = {0};
+    if (!tx_info->multisig_fp_set || tx_info->multisig_fp_mismatch ||
+        !cryptoMultisigFingerprint(&(txoutput->multisig), h) ||
+        memcmp(tx_info->multisig_fp, h, 32) != 0) {
+      return false;
+    }
+  }
+
+  return check_change_bip32_path(tx_info, txoutput);
+}
+
 static bool signing_check_output(TxOutputType *txoutput) {
   // Phase1: Check outputs
   //   add it to hash_outputs
   //   ask user for permission
 
   // check for change address
-  bool is_change = false;
-  if (txoutput->address_n_count > 0) {
-    /*
-     * For multisig check that all inputs are multisig
-     */
-    if (txoutput->has_multisig) {
-      uint8_t h[32] = {0};
-      if (multisig_fp_set && !multisig_fp_mismatch &&
-          cryptoMultisigFingerprint(&(txoutput->multisig), h) &&
-          memcmp(multisig_fp, h, 32) == 0) {
-        is_change = check_change_bip32_path(txoutput);
-      }
-    } else {
-      is_change = check_change_bip32_path(txoutput);
-    }
-  }
-
-  if (!is_change_output_script_type(txoutput)) {
-    is_change = false;
-  }
+  bool is_change = is_change_output(&info, txoutput);
 
   if (is_change) {
     if (change_spend + txoutput->amount < change_spend) {
@@ -949,7 +982,7 @@ static bool signing_check_output(TxOutputType *txoutput) {
   }
 #endif
   //  compute segwit hashOuts
-  tx_output_hash(&hasher_outputs, &bin_output, coin->decred);
+  tx_output_hash(&info.hasher_outputs, &bin_output, coin->decred);
   return true;
 }
 
@@ -992,7 +1025,7 @@ static bool signing_confirm_tx(void) {
   }
 
   if (lock_time != 0) {
-    bool lock_time_disabled = (min_sequence == SEQUENCE_FINAL);
+    bool lock_time_disabled = (info.min_sequence == SEQUENCE_FINAL);
     layoutConfirmNondefaultLockTime(lock_time, lock_time_disabled);
     if (!protectButton(ButtonRequestType_ButtonRequest_SignTx, false)) {
       fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
@@ -1032,7 +1065,7 @@ static void phase1_request_next_output(void) {
       tx_hash_final(&ti, decred_hash_prefix, false);
     }
 #endif
-    hasher_Final(&hasher_outputs, hash_outputs);
+    hasher_Final(&info.hasher_outputs, info.hash_outputs);
     if (!signing_confirm_tx()) {
       return;
     }
@@ -1041,20 +1074,21 @@ static void phase1_request_next_output(void) {
   }
 }
 
-static void signing_hash_bip143(const TxInputType *txinput, uint8_t *hash) {
+static void signing_hash_bip143(const TxInfo *tx_info,
+                                const TxInputType *txinput, uint8_t *hash) {
   uint32_t hash_type = signing_hash_type();
   Hasher hasher_preimage = {0};
   hasher_Init(&hasher_preimage, coin->curve->hasher_sign);
   hasher_Update(&hasher_preimage, (const uint8_t *)&version, 4);  // nVersion
-  hasher_Update(&hasher_preimage, hash_prevouts, 32);  // hashPrevouts
-  hasher_Update(&hasher_preimage, hash_sequence, 32);  // hashSequence
-  tx_prevout_hash(&hasher_preimage, txinput);          // outpoint
+  hasher_Update(&hasher_preimage, tx_info->hash_prevouts, 32);  // hashPrevouts
+  hasher_Update(&hasher_preimage, tx_info->hash_sequence, 32);  // hashSequence
+  tx_prevout_hash(&hasher_preimage, txinput);                   // outpoint
   tx_script_hash(&hasher_preimage, txinput->script_sig.size,
                  txinput->script_sig.bytes);  // scriptCode
   hasher_Update(&hasher_preimage, (const uint8_t *)&txinput->amount,
-                8);                                   // amount
-  tx_sequence_hash(&hasher_preimage, txinput);        // nSequence
-  hasher_Update(&hasher_preimage, hash_outputs, 32);  // hashOutputs
+                8);                                            // amount
+  tx_sequence_hash(&hasher_preimage, txinput);                 // nSequence
+  hasher_Update(&hasher_preimage, tx_info->hash_outputs, 32);  // hashOutputs
   hasher_Update(&hasher_preimage, (const uint8_t *)&lock_time, 4);  // nLockTime
   hasher_Update(&hasher_preimage, (const uint8_t *)&hash_type, 4);  // nHashType
   hasher_Final(&hasher_preimage, hash);
@@ -1062,7 +1096,8 @@ static void signing_hash_bip143(const TxInputType *txinput, uint8_t *hash) {
 
 #if !BITCOIN_ONLY
 
-static void signing_hash_zip243(const TxInputType *txinput, uint8_t *hash) {
+static void signing_hash_zip243(const TxInfo *tx_info,
+                                const TxInputType *txinput, uint8_t *hash) {
   uint32_t hash_type = signing_hash_type();
   uint8_t personal[16] = {0};
   memcpy(personal, "ZcashSigHash", 12);
@@ -1073,11 +1108,14 @@ static void signing_hash_zip243(const TxInputType *txinput, uint8_t *hash) {
   uint32_t ver = version | TX_OVERWINTERED;  // 1. nVersion | fOverwintered
   hasher_Update(&hasher_preimage, (const uint8_t *)&ver, 4);
   hasher_Update(&hasher_preimage, (const uint8_t *)&version_group_id,
-                4);                                    // 2. nVersionGroupId
-  hasher_Update(&hasher_preimage, hash_prevouts, 32);  // 3. hashPrevouts
-  hasher_Update(&hasher_preimage, hash_sequence, 32);  // 4. hashSequence
-  hasher_Update(&hasher_preimage, hash_outputs, 32);   // 5. hashOutputs
-                                                       // 6. hashJoinSplits
+                4);  // 2. nVersionGroupId
+  hasher_Update(&hasher_preimage, tx_info->hash_prevouts,
+                32);  // 3. hashPrevouts
+  hasher_Update(&hasher_preimage, tx_info->hash_sequence,
+                32);  // 4. hashSequence
+  hasher_Update(&hasher_preimage, tx_info->hash_outputs,
+                32);  // 5. hashOutputs
+                      // 6. hashJoinSplits
   hasher_Update(&hasher_preimage, (const uint8_t *)"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 32);
   // 7. hashShieldedSpends
   hasher_Update(&hasher_preimage, (const uint8_t *)"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 32);
@@ -1164,7 +1202,7 @@ static bool signing_sign_hash(TxInputType *txinput, const uint8_t *private_key,
 static bool signing_sign_input(void) {
   uint8_t hash[32] = {0};
   hasher_Final(&hasher_check, hash);
-  if (memcmp(hash, hash_outputs, 32) != 0) {
+  if (memcmp(hash, info.hash_outputs, 32) != 0) {
     fsm_sendFailure(FailureType_Failure_DataError,
                     _("Transaction has changed during signing"));
     signing_abort();
@@ -1199,7 +1237,7 @@ static bool signing_sign_segwit_input(TxInputType *txinput) {
       return false;
     }
 
-    signing_hash_bip143(txinput, hash);
+    signing_hash_bip143(&info, txinput, hash);
 
     resp.has_serialized = true;
     if (!signing_sign_hash(txinput, node.private_key, node.public_key, hash))
@@ -1700,11 +1738,11 @@ void signing_txack(TransactionType *tx) {
             signing_abort();
             return;
           }
-          signing_hash_zip243(&tx->inputs[0], hash);
+          signing_hash_zip243(&info, &tx->inputs[0], hash);
         } else
 #endif
         {
-          signing_hash_bip143(&tx->inputs[0], hash);
+          signing_hash_bip143(&info, &tx->inputs[0], hash);
         }
         if (!signing_sign_hash(&tx->inputs[0], node.private_key,
                                node.public_key, hash))
