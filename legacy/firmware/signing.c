@@ -39,7 +39,10 @@ static CONFIDENTIAL HDNode node;
 static bool signing = false;
 enum {
   STAGE_REQUEST_1_INPUT,
+  STAGE_REQUEST_1_ORIG_META,
+  STAGE_REQUEST_1_ORIG_INPUT,
   STAGE_REQUEST_2_OUTPUT,
+  STAGE_REQUEST_2_ORIG_OUTPUT,
   STAGE_REQUEST_3_INPUT,
   STAGE_REQUEST_3_PREV_META,
   STAGE_REQUEST_3_PREV_INPUT,
@@ -60,6 +63,7 @@ static uint32_t idx1, idx2;
 static uint32_t signatures;
 static TxRequest resp;
 static TxInputType input;
+static TxOutputType output;
 static TxOutputBinType bin_output;
 static TxStruct to, tp, ti;
 static Hasher hasher_check;
@@ -70,6 +74,7 @@ static uint8_t decred_hash_prefix[32];
 #endif
 static uint8_t hash_inputs_check[32];
 static uint64_t total_in, total_out, change_out;
+static uint64_t orig_total_in, orig_total_out, orig_change_out;
 static uint32_t version = 1;
 static uint32_t lock_time = 0;
 static uint32_t expiry = 0;
@@ -98,6 +103,8 @@ typedef struct {
 } TxInfo;
 
 static TxInfo info;
+static TxInfo orig_info;
+static uint8_t orig_hash[32];
 
 /* A marker for in_address_n_count to indicate a mismatch in bip32 paths in
    input */
@@ -123,6 +130,10 @@ static TxInfo info;
 /* Setting nSequence to this value for every input in a transaction disables
    nLockTime. */
 #define SEQUENCE_FINAL 0xffffffff
+
+/* Setting nSequence to a value greater than this for every input in a
+   transaction disables replace-by-fee opt-in. */
+#define MAX_BIP125_RBF_SEQUENCE 0xFFFFFFFD
 
 enum {
   SIGHASH_ALL = 1,
@@ -255,6 +266,20 @@ void send_req_1_input(void) {
   msg_write(MessageType_MessageType_TxRequest, &resp);
 }
 
+void send_req_1_orig_input(void) {
+  signing_stage = STAGE_REQUEST_1_ORIG_INPUT;
+  resp.has_request_type = true;
+  resp.request_type = RequestType_TXORIGINPUT;
+  resp.has_details = true;
+  resp.details.has_request_index = true;
+  resp.details.request_index = input.orig_index;
+  resp.details.has_tx_hash = true;
+  resp.details.tx_hash.size = input.orig_hash.size;
+  memcpy(resp.details.tx_hash.bytes, input.orig_hash.bytes,
+         resp.details.tx_hash.size);
+  msg_write(MessageType_MessageType_TxRequest, &resp);
+}
+
 void send_req_2_output(void) {
   signing_stage = STAGE_REQUEST_2_OUTPUT;
   resp.has_request_type = true;
@@ -262,6 +287,20 @@ void send_req_2_output(void) {
   resp.has_details = true;
   resp.details.has_request_index = true;
   resp.details.request_index = idx1;
+  msg_write(MessageType_MessageType_TxRequest, &resp);
+}
+
+void send_req_2_orig_output(void) {
+  signing_stage = STAGE_REQUEST_2_ORIG_OUTPUT;
+  resp.has_request_type = true;
+  resp.request_type = RequestType_TXORIGOUTPUT;
+  resp.has_details = true;
+  resp.details.has_request_index = true;
+  resp.details.request_index = output.orig_index;  // TODO
+  resp.details.has_tx_hash = true;
+  resp.details.tx_hash.size = output.orig_hash.size;
+  memcpy(resp.details.tx_hash.bytes, output.orig_hash.bytes,
+         resp.details.tx_hash.size);
   msg_write(MessageType_MessageType_TxRequest, &resp);
 }
 
@@ -618,7 +657,11 @@ void signing_init(const SignTx *msg, const CoinInfo *_coin,
   total_out = 0;
   change_out = 0;
   change_count = 0;
+  orig_total_in = 0;
+  orig_total_out = 0;
+  orig_change_out = 0;
   memzero(&input, sizeof(TxInputType));
+  memzero(&output, sizeof(TxOutputType));
   memzero(&resp, sizeof(TxRequest));
 
   signing = true;
@@ -731,6 +774,13 @@ static bool signing_validate_input(const TxInputType *txinput) {
     }
   }
 
+  if (txinput->has_orig_hash && !txinput->has_orig_index) {
+    fsm_sendFailure(FailureType_Failure_DataError,
+                    _("Missing orig_index field."));
+    signing_abort();
+    return false;
+  }
+
   return true;
 }
 
@@ -783,6 +833,14 @@ static bool signing_validate_output(TxOutputType *txoutput) {
       return false;
     }
   }
+
+  if (txoutput->has_orig_hash && !txoutput->has_orig_index) {
+    fsm_sendFailure(FailureType_Failure_DataError,
+                    _("Missing orig_index field."));
+    signing_abort();
+    return false;
+  }
+
   return true;
 }
 
@@ -999,6 +1057,7 @@ static bool signing_confirm_tx(void) {
     }
   }
 
+  uint64_t spending = total_in - change_out;
   uint64_t fee = 0;
   if (total_out <= total_in) {
     fee = total_in - total_out;
@@ -1024,9 +1083,77 @@ static bool signing_confirm_tx(void) {
     }
   }
 
-  if (lock_time != 0) {
-    bool lock_time_disabled = (info.min_sequence == SEQUENCE_FINAL);
-    layoutConfirmNondefaultLockTime(lock_time, lock_time_disabled);
+  if (orig_total_in != 0) {
+    // Replacement transaction.
+
+    uint64_t orig_spending = orig_total_in - orig_change_out;
+    uint64_t orig_fee = orig_total_in - orig_total_out;
+
+    // Replacement transactions are only allowed to make amendments which
+    // do not increase the amount that we are spending on external outputs.
+    // In other words, the total amount being sent out of the wallet must
+    // not increase by more than the fee difference (so additional funds
+    // can only go towards the fee, which is confirmed by the user).
+    if (spending - orig_spending > fee - orig_fee) {
+      fsm_sendFailure(FailureType_Failure_ProcessError,
+                      _("Invalid replacement transaction."));
+      signing_abort();
+      return false;
+    }
+
+    // Replacement transactions must not change the effective nLockTime.
+    uint32_t effective_lock_time =
+        info.min_sequence == SEQUENCE_FINAL ? 0 : lock_time;
+    uint32_t orig_effective_lock_time = orig_info.min_sequence == SEQUENCE_FINAL
+                                            ? 0
+                                            : orig.tx.lock_time;  // TODO
+    if (lock_time != orig_effective_lock_time) {
+      fsm_sendFailure(FailureType_Failure_ProcessError,
+                      _("Original transactions must have same effective "
+                        "nLockTime as replacement transaction."));
+      signing_abort();
+      return false;
+    }
+
+    bool rbf_disabled = info.min_sequence > MAX_BIP125_RBF_SEQUENCE;
+    bool orig_rbf_disabled = orig_info.min_sequence > MAX_BIP125_RBF_SEQUENCE;
+    char *description = NULL;
+    if (rbf_disabled && !orig_rbf_disabled) {
+      description = _("Finalize transaction");
+    } else {
+      description = _("Fee modification");
+    }
+
+    // Confirm original TXID.
+    layoutConfirmReplacement(description, orig_hash);
+    if (!protectButton(ButtonRequestType_ButtonRequest_SignTx, false)) {
+      fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
+      signing_abort();
+      return false;
+    }
+
+    // Final confirmation.
+    layoutConfirmModifyFee(coin, spending - orig_spending, fee);
+    if (!protectButton(ButtonRequestType_ButtonRequest_SignTx, false)) {
+      fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
+      signing_abort();
+      return false;
+    }
+  } else {
+    // Standard transaction.
+
+    if (lock_time != 0) {
+      bool lock_time_disabled = (info.min_sequence == SEQUENCE_FINAL);
+      layoutConfirmNondefaultLockTime(lock_time, lock_time_disabled);
+      if (!protectButton(ButtonRequestType_ButtonRequest_SignTx, false)) {
+        fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
+        signing_abort();
+        return false;
+      }
+    }
+
+    // last confirmation
+    layoutConfirmTx(coin, spending, fee);
     if (!protectButton(ButtonRequestType_ButtonRequest_SignTx, false)) {
       fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
       signing_abort();
@@ -1034,13 +1161,6 @@ static bool signing_confirm_tx(void) {
     }
   }
 
-  // last confirmation
-  layoutConfirmTx(coin, total_in - change_out, fee);
-  if (!protectButton(ButtonRequestType_ButtonRequest_SignTx, false)) {
-    fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
-    signing_abort();
-    return false;
-  }
   return true;
 }
 
